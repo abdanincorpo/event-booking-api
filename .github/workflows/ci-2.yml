@@ -1,0 +1,54 @@
+name: CI
+
+# Pull-request checks. Pushes to master run the full delivery pipeline
+# (pipeline.yml), which repeats these tests before deploying.
+on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # Throwaway database for the integration tests; it exists only for this job.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: booking_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    env:
+      # Integration tests skip when this is unset; it points them at the service above.
+      TEST_DATABASE_URL: host=localhost port=5432 user=postgres dbname=booking_test sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Latest 1.26 patch release: an exact version from go.mod would miss
+          # standard-library security fixes and fail govulncheck.
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit, seeder and integration tests
+        run: go test ./... -count=1
+
+      - name: Concurrency tests (20 repetitions)
+        run: go test ./tests/integration/... -run 'Concurrent|IdempotentConcurrent' -count=20
+
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      - name: Docker build
+        run: docker build -t event-booking-api:${{ github.sha }} .
