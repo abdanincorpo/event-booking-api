@@ -1,9 +1,8 @@
-
 ---
-title: Event Booking API
-emoji: 🎟️
+title: Quzuu Api Dev
+emoji: 🐠
 colorFrom: indigo
-colorTo: purple
+colorTo: gray
 sdk: docker
 pinned: false
 ---
