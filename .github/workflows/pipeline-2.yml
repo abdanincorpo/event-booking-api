@@ -1,0 +1,239 @@
+# Delivery pipeline (see the architecture diagram):
+#   merge to master -> unit & integration tests -> dependency check
+#   -> deploy to Hugging Face Space (QA) -> OpenAPI smoke test
+#   -> BlazeMeter performance test -> report (BlazeMeter + Actions log)
+#
+# Required configuration, all on the "qa" environment:
+#   secrets   HF_TOKEN, QA_DB_HOST, QA_DB_PORT, QA_DB_USER, QA_DB_PASSWORD, QA_DB_NAME,
+#             BLAZEMETER_API_KEY_ID, BLAZEMETER_API_KEY_SECRET
+#   variables HF_SPACE (owner/space), QA_BASE_URL (https://owner-space.hf.space),
+#             BLAZEMETER_TEST_ID, BLAZEMETER_SCENARIOS (optional, default "PT-01,PT-05")
+name: Pipeline
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: Comma-separated performance scenarios (PT-01 ... PT-05)
+        default: PT-01,PT-05
+        required: true
+
+permissions:
+  contents: read
+
+# Explicit bash turns on -o pipefail, so "check | tee" still fails the step.
+defaults:
+  run:
+    shell: bash
+
+# One pipeline at a time: QA is a single shared environment. A newer push waits
+# instead of cancelling a deployment halfway.
+concurrency:
+  group: pipeline-qa
+  cancel-in-progress: false
+
+jobs:
+  unit-test:
+    name: Run Unit Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: booking_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    env:
+      # Integration tests skip when this is unset; it points them at the service above.
+      TEST_DATABASE_URL: host=localhost port=5432 user=postgres dbname=booking_test sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      - run: go vet ./...
+      - name: Unit, seeder and integration tests
+        run: |
+          mkdir -p out
+          go run gotest.tools/gotestsum@v1.13.0 --junitfile out/integration.xml -- ./... -count=1
+      - name: Concurrency tests (20 repetitions)
+        run: go test ./tests/integration/... -run 'Concurrent|IdempotentConcurrent' -count=20
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-report
+          path: out/integration.xml
+          if-no-files-found: ignore
+
+  dependency-check:
+    name: Run Dependabot
+    # Dependabot itself runs from .github/dependabot.yml and opens update PRs.
+    # This gate blocks a deploy when a dependency has a known, reachable vulnerability.
+    needs: unit-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      - name: Verify module checksums
+        run: go mod verify
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  deploy:
+    name: Deploy to HF
+    needs: dependency-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet "huggingface_hub>=0.25"
+      - name: Prepare Space contents
+        run: |
+          mkdir -p "$RUNNER_TEMP/space"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/space"
+          echo "$GITHUB_SHA" > "$RUNNER_TEMP/space/VERSION"
+          # Hugging Face reads the Space configuration from README front matter.
+          { printf -- '---\ntitle: Event Booking API\nsdk: docker\napp_port: 7860\npinned: false\n---\n\n'
+            cat README.md; } > "$RUNNER_TEMP/space/README.md"
+      - name: Configure secrets and push to Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+          DB_HOST: ${{ secrets.QA_DB_HOST }}
+          DB_PORT: ${{ secrets.QA_DB_PORT }}
+          DB_USER: ${{ secrets.QA_DB_USER }}
+          DB_PASSWORD: ${{ secrets.QA_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.QA_DB_NAME }}
+        run: python scripts/hf_deploy.py "$RUNNER_TEMP/space"
+      - name: Wait for the new version to go live
+        run: bash scripts/wait_for_version.sh "${{ vars.QA_BASE_URL }}" "$GITHUB_SHA" 900
+
+  smoke-test:
+    name: Run Smoke-test OpenAPI
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      # The container seeds the fixed dataset on startup (skipping if already
+      # seeded). Here we only derive its deterministic IDs; no database access.
+      - name: Export fixture IDs
+        run: go run ./cmd/seed -export out/smoke
+      - name: Smoke test against the OpenAPI document
+        run: bash scripts/smoke_test.sh "${{ vars.QA_BASE_URL }}" out/smoke
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test
+          path: out/smoke/smoke-results.md
+          if-no-files-found: ignore
+
+  plan-performance:
+    name: Select performance scenarios
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    outputs:
+      scenarios: ${{ steps.pick.outputs.scenarios }}
+    steps:
+      - id: pick
+        env:
+          REQUESTED: ${{ github.event.inputs.scenarios || vars.BLAZEMETER_SCENARIOS || 'PT-01,PT-05' }}
+        run: echo "scenarios=$(echo "$REQUESTED" | jq -Rc 'split(",") | map(gsub(" ";""))')" >> "$GITHUB_OUTPUT"
+
+  blazemeter:
+    name: Run Blazemeter Test (${{ matrix.scenario }})
+    needs: plan-performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: qa
+    strategy:
+      fail-fast: false
+      max-parallel: 1 # never load QA with two scenarios at once
+      matrix:
+        scenario: ${{ fromJson(needs.plan-performance.outputs.scenarios) }}
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+      # Read-only use: the post-run correctness queries.
+      DB_HOST: ${{ secrets.QA_DB_HOST }}
+      DB_PORT: ${{ secrets.QA_DB_PORT }}
+      DB_USER: ${{ secrets.QA_DB_USER }}
+      DB_PASSWORD: ${{ secrets.QA_DB_PASSWORD }}
+      DB_NAME: ${{ secrets.QA_DB_NAME }}
+      DB_SSLMODE: require
+      OUT: out/perf/${{ matrix.scenario }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+      - name: Export fixture IDs
+        run: go run ./cmd/seed -export "$OUT/data"
+      - name: Wait for flash-sale stock to be released by the previous run
+        if: matrix.scenario == 'PT-05'
+        run: bash scripts/perf/wait_for_stock.sh "${{ vars.QA_BASE_URL }}" "$OUT/data/event.properties" flash 720
+      - name: Build BlazeMeter (Taurus) test files
+        run: bash scripts/perf/build_taurus.sh "$SCENARIO" "${{ vars.QA_BASE_URL }}" "$OUT/data" "$OUT/bzt"
+      - name: Run on BlazeMeter
+        id: bzm
+        env:
+          BLAZEMETER_API_KEY_ID: ${{ secrets.BLAZEMETER_API_KEY_ID }}
+          BLAZEMETER_API_KEY_SECRET: ${{ secrets.BLAZEMETER_API_KEY_SECRET }}
+          BLAZEMETER_TEST_ID: ${{ vars.BLAZEMETER_TEST_ID }}
+        run: bash scripts/perf/blazemeter_run.sh "$OUT/bzt" "$(jq -r --arg s "$SCENARIO" '.[$s].timeout_min' perf/scenarios.json)" "$OUT"
+      - name: Correctness checks on the QA database
+        if: always() && steps.bzm.outcome != 'skipped'
+        run: |
+          sleep 20 # let the sweeper release holds that expired at the end of the run
+          bash scripts/perf/correctness.sh "$SCENARIO" "$OUT/data/event.properties" | tee "$OUT/correctness.txt"
+      - name: Check thresholds
+        if: always() && steps.bzm.outcome == 'success'
+        run: python scripts/perf/check_thresholds.py "$SCENARIO" "$OUT/aggregate.json" perf/thresholds.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blazemeter-${{ matrix.scenario }}
+          path: |
+            ${{ env.OUT }}/*.json
+            ${{ env.OUT }}/*.txt
+          if-no-files-found: ignore
+
+  report:
+    name: Report
+    needs: [unit-test, dependency-check, deploy, smoke-test, blazemeter]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline summary
+        env:
+          RESULTS: ${{ toJson(needs) }}
+        run: |
+          {
+            echo "## Pipeline result for \`${GITHUB_SHA::7}\`"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "$RESULTS" | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"'
+            echo
+            echo "BlazeMeter report links and threshold tables are in each **Run Blazemeter Test** job summary and artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")' > /dev/null
