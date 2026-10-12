@@ -1,4 +1,15 @@
+
+---
+title: Event Booking API
+emoji: 🎟️
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # Event Ticket Booking API
+
 
 A deliberately small REST API built to be tested: it must never oversell a
 limited stock of tickets, never take two payments for one booking, and release
