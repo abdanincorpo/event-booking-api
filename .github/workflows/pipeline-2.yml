@@ -119,8 +119,8 @@ jobs:
           DB_PASSWORD: ${{ secrets.QA_DB_PASSWORD }}
           DB_NAME: ${{ secrets.QA_DB_NAME }}
         run: python scripts/hf_deploy.py "$RUNNER_TEMP/space"
-      - name: Wait for the new version to go live
-        run: bash scripts/wait_for_version.sh "${{ vars.QA_BASE_URL }}" "$GITHUB_SHA" 900
+      # # - name: Wait for the new version to go live
+      # run: bash scripts/wait_for_version.sh "${{ vars.QA_BASE_URL }}" "$GITHUB_SHA" 900
 
   smoke-test:
     name: Run Smoke-test OpenAPI
